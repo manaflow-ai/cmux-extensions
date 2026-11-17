@@ -5,5 +5,12 @@
     "author": "Manaflow",
     "description": "The sample cmux extension and the template for new ones: a sidebar section built on the extension SDK, with no scopes.",
     "repo": "manaflow-ai/cmux-extension-sample"
+  },
+  {
+    "id": "manaflow-ai/focus-timer",
+    "name": "Focus Timer",
+    "author": "Manaflow",
+    "description": "A sidebar section with a 15, 25 or 50 minute focus session: start, pause, reset, and a toast when the time is up.",
+    "repo": "manaflow-ai/focus-timer"
   }
 ]
