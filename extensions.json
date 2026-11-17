@@ -1,0 +1,9 @@
+[
+  {
+    "id": "manaflow-ai/cmux-extension-sample",
+    "name": "Sample Extension",
+    "author": "Manaflow",
+    "description": "The sample cmux extension and the template for new ones: a sidebar section built on the extension SDK, with no scopes.",
+    "repo": "manaflow-ai/cmux-extension-sample"
+  }
+]

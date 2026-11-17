@@ -1,0 +1,8 @@
+{
+  "json.schemas": [
+    {
+      "fileMatch": ["/extensions.json", "/themes.json", "/snippets.json", "/setups.json"],
+      "url": "./schemas/registry-entries.schema.json"
+    }
+  ]
+}

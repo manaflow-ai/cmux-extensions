@@ -1,0 +1,70 @@
+# Runs on every pull request with the PR's own code and read-only access: the validator's tests,
+# then the review of the added or changed entries. It saves the PR number and head for
+# post-review.yml, which re-runs the review with main's validator and posts the summary comment
+# (a fork's pull_request run cannot comment).
+name: Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the validator's one dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet -r review/requirements.txt
+
+      - name: Validator tests
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s review/tests'
+
+      - name: Base copies of the entry files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/base"
+          for f in extensions.json themes.json snippets.json setups.json; do
+            git show "$BASE_SHA:$f" > "$RUNNER_TEMP/base/$f" 2>/dev/null || echo '[]' > "$RUNNER_TEMP/base/$f"
+          done
+
+      - name: Review added and changed entries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" review/review.py --root . --base-dir "$RUNNER_TEMP/base" \
+            --out "$RUNNER_TEMP/comment.md" --quiet || status=$?
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "${status:-0}"
+
+      - name: Save the PR number for the comment
+        if: always()
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr"
+          printf '{"number": %s, "head": "%s"}\n' "$PR_NUMBER" "$HEAD_SHA" > "$RUNNER_TEMP/pr/pr.json"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: pr
+          path: ${{ runner.temp }}/pr/pr.json
+          retention-days: 3

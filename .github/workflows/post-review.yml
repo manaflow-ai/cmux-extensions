@@ -1,0 +1,105 @@
+# After Review finishes on a pull request: run the review again with main's validator (the PR
+# cannot change it here), treating the PR's entry files as data only, then post or update one
+# summary comment and set the `registry-review` commit status on the PR head. The PR number comes
+# from the Review run's artifact and is trusted only when that PR's head is the run's head.
+name: Post review
+
+on:
+  workflow_run:
+    workflows: [Review]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+jobs:
+  post:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download the PR number
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: pr
+          path: ${{ runner.temp }}/pr
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Match the PR to the run
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          number=$(jq -r '.number | tonumber' "$RUNNER_TEMP/pr/pr.json")
+          case "$number" in (''|*[!0-9]*) echo "bad PR number"; exit 1;; esac
+          head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" --jq .head.sha)
+          if [ "$head" != "$RUN_HEAD" ]; then
+            echo "PR #$number is at $head, the run was for $RUN_HEAD: a newer push will post"; exit 0
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: The PR's entry files (data only)
+        if: steps.pr.outputs.number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          # A file that cannot be read stays empty, which the review reports as invalid JSON.
+          mkdir -p "$RUNNER_TEMP/head"
+          for f in extensions.json themes.json snippets.json setups.json; do
+            gh api -H 'Accept: application/vnd.github.raw' \
+              "repos/$GITHUB_REPOSITORY/contents/$f?ref=$RUN_HEAD" > "$RUNNER_TEMP/head/$f" 2>/dev/null \
+              || gh api -H 'Accept: application/vnd.github.raw' \
+                "repos/$HEAD_REPO/contents/$f?ref=$RUN_HEAD" > "$RUNNER_TEMP/head/$f" \
+              || echo "could not read $f at $RUN_HEAD" >&2
+          done
+
+      - name: Review with main's validator
+        if: steps.pr.outputs.number
+        id: review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet -r review/requirements.txt
+          "$RUNNER_TEMP/venv/bin/python" review/review.py --root "$RUNNER_TEMP/head" --base-dir . \
+            --out "$RUNNER_TEMP/comment.md" --quiet && echo "state=success" >> "$GITHUB_OUTPUT" \
+            || echo "state=failure" >> "$GITHUB_OUTPUT"
+          printf '\n<sub>Review of %s with the validator on main (%s). [Run](%s)</sub>\n' \
+            "$RUN_HEAD" "$GITHUB_SHA" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> "$RUNNER_TEMP/comment.md"
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post the comment and the status
+        if: steps.pr.outputs.number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ steps.pr.outputs.number }}
+          STATE: ${{ steps.review.outputs.state }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments?per_page=100" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- cmux-registry-review -->")))][0].id // empty')
+          body=$(jq -Rs '{body: .}' "$RUNNER_TEMP/comment.md")
+          if [ -n "$existing" ]; then
+            echo "$body" | gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" --input - > /dev/null
+          else
+            echo "$body" | gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" --input - > /dev/null
+          fi
+          description=$([ "$STATE" = success ] && echo "Automated review passed" || echo "Automated review found problems: see the comment")
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$RUN_HEAD" \
+            -f state="$STATE" -f context=registry-review -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /dev/null

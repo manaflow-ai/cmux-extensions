@@ -1,0 +1,4 @@
+Copied from manaflow-ai/cmux feat-cmux-next at 07cf11a48f16885adf070e6dd67de76e58df4c09:
+cmux-tui/crates/cmux-app-host/schema/v2/cmux-app.schema.json -> cmux-app.v2.schema.json
+cmux-tui/crates/cmux-app-host/schema/v2/cmux-app-catalog.schema.json -> cmux-app-catalog.schema.json
+The app embeds these in cmux-tui/crates/cmux-app-manifest (src/lib.rs SCHEMA, src/catalog.rs).

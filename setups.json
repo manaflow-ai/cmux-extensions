@@ -1,0 +1,9 @@
+[
+  {
+    "id": "manaflow-ai/cmux-setup-sample",
+    "name": "Sample Setup",
+    "author": "Manaflow",
+    "description": "A dusk theme, a hello action and the sample extension, in one install. The sample setup.",
+    "repo": "manaflow-ai/cmux-setup-sample"
+  }
+]
