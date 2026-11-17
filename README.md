@@ -9,7 +9,7 @@ listed once its entry is on `main` here.
 
 | File | What it lists | Where the item lives |
 |---|---|---|
-| [`extensions.json`](extensions.json) | Plugins: an app manifest v2 (`cmux-app.v2.json`) and its code, run in the sandboxed app host with the scopes it declares | The repo's releases |
+| [`extensions.json`](extensions.json) | Plugins: an app manifest v2 (`cmux-app.json` or `cmux-app.v2.json`) and its code, run in the sandboxed app host with the scopes it declares | The repo's releases |
 | [`themes.json`](themes.json) | Themes: cmux theme files (`themes/NAME.json`, the format `cmux theme check` reads), no code | `cmux-theme.json` and `themes/*.json` in the repo |
 | [`snippets.json`](snippets.json) | Snippets: a few settings and/or one surface stylesheet, no code | `cmux-snippet.json` in the repo |
 | [`setups.json`](setups.json) | Setups: a whole customization (theme, keymap, sidebar, actions, extensions) in one install | `cmux-setup.json` in the repo |
@@ -19,8 +19,8 @@ listed once its entry is on `main` here.
 1. Make the repo. `cmux ext new NAME --repo OWNER/REPO` writes a ready one, or start from the
    template [manaflow-ai/cmux-extension-sample](https://github.com/manaflow-ai/cmux-extension-sample).
    `cmux ext publish` checks it is ready and prints the release command.
-2. Publish a release. Its tag is the manifest `version` (`1.2.0` or `v1.2.0`) and it has two assets:
-   - `cmux-app.v2.json`: the manifest
+2. Publish a release. Its tag is the manifest `version`, with or without a `v` (`1.2.0` or `v1.2.0`) and it has two assets:
+   - `cmux-app.json` (or `cmux-app.v2.json`; v2 wins when a release has both): the manifest
    - `cmux-extension.tar.gz`: the built package (the manifest and every file it lists), made by `cmux ext pack`
 
    Themes, snippets and setups need no assets: the review reads the marker file (`cmux-theme.json`,
@@ -65,7 +65,7 @@ All files:
 - a repo (and path) is listed once per file
 
 Each added or changed entry, fetched from its repo:
-- extension: the newest release with both assets; `cmux-app.v2.json` passes the manifest v2 schema
+- extension: the newest release with both assets; the manifest asset passes the manifest v2 schema
   ([vendored](schemas/vendor/) from the cmux app); its `id` is the entry's; the tag is the manifest
   version; `repository` is the repo; every scope and optional scope has a reason (a sentence, not
   `todo`); `cmux-extension.tar.gz` unpacks safely (no links, no `..`, size bounds), its manifest

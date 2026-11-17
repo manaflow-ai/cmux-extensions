@@ -4,7 +4,7 @@
 Checks the four entry files (shape, unique ids, owner rule) and, for every entry
 a pull request adds or changes, fetches what the entry points at:
 
-- extensions: the newest release with `cmux-app.v2.json` and `cmux-extension.tar.gz`;
+- extensions: the newest release with `cmux-app.json` or `cmux-app.v2.json` and `cmux-extension.tar.gz`;
   the manifest against the vendored v2 schema, id, tag, scope reasons; the package's
   manifest equals the asset, the files it names are there, its script parses.
 - themes: `cmux-theme.json` (`"cmuxTheme": 1`, id, version tag) and each theme file it names
@@ -53,7 +53,8 @@ KINDS = {
 RESERVED_OWNERS = {"cmux", "manaflow-ai"}
 TRUSTED_OWNER = "manaflow-ai"
 
-MANIFEST_ASSET = "cmux-app.v2.json"
+# The manifest asset: `cmux-app.v2.json`, or `cmux-app.json` (what `cmux ext new` writes); v2 first.
+MANIFEST_ASSETS = ("cmux-app.v2.json", "cmux-app.json")
 PACKAGE_ASSET = "cmux-extension.tar.gz"
 PACKAGE_MANIFESTS = ("cmux-app.v2.json", "cmux-app.json")
 SETUP_FILE = "cmux-setup.json"
@@ -322,15 +323,18 @@ def diff(entries: dict[str, list], base: dict[str, list]) -> tuple[list[tuple[st
 # ---------------------------------------------------------------- per kind
 
 
-def newest_release_with(gh: GitHub, owner: str, repo: str, wanted: tuple[str, ...]):
+def newest_release_with(gh: GitHub, owner: str, repo: str):
+    """The newest published release with the package and a manifest asset, and that asset's
+    name (`cmux-app.v2.json` preferred over `cmux-app.json`)."""
     releases = gh.json(f"/repos/{owner}/{repo}/releases?per_page={RELEASES_LOOKED_AT}")
     for release in releases:
         if release.get("draft") or release.get("prerelease"):
             continue
         names = {a.get("name") for a in release.get("assets", [])}
-        if all(w in names for w in wanted):
-            return release, releases
-    return None, releases
+        manifest = next((m for m in MANIFEST_ASSETS if m in names), None)
+        if manifest and PACKAGE_ASSET in names:
+            return release, manifest, releases
+    return None, None, releases
 
 
 def asset_url(release: dict, name: str) -> str:
@@ -461,32 +465,32 @@ def check_extension(gh: GitHub, entry: dict, result: Result) -> None:
     if host != "github.com":
         result.warnings.append(f"releases on {host} are not checked automatically; a reviewer checks them by hand")
         return
-    release, releases = newest_release_with(gh, owner, repo, (MANIFEST_ASSET, PACKAGE_ASSET))
+    release, manifest_asset, releases = newest_release_with(gh, owner, repo)
     if release is None:
         if not releases:
-            result.errors.append(f"no release yet: publish one with the assets `{MANIFEST_ASSET}` and `{PACKAGE_ASSET}` (`cmux ext publish` prints the command)")
+            result.errors.append(f"no release yet: publish one with the assets `cmux-app.json` (or `cmux-app.v2.json`) and `{PACKAGE_ASSET}` (`cmux ext publish` prints the command)")
         else:
-            result.errors.append(f"no release among the newest {RELEASES_LOOKED_AT} has both `{MANIFEST_ASSET}` and `{PACKAGE_ASSET}`")
+            result.errors.append(f"no release among the newest {RELEASES_LOOKED_AT} has both a manifest (`cmux-app.json` or `cmux-app.v2.json`) and `{PACKAGE_ASSET}`")
         return
     tag = release["tag_name"]
     result.checked.append(f"release {tag}")
 
     try:
-        manifest_raw = gh.download(asset_url(release, MANIFEST_ASSET), MANIFEST_LIMIT)
+        manifest_raw = gh.download(asset_url(release, manifest_asset), MANIFEST_LIMIT)
         manifest = json.loads(manifest_raw)
     except FetchError as error:
-        result.errors.append(f"`{MANIFEST_ASSET}`: {error}")
+        result.errors.append(f"`{manifest_asset}`: {error}")
         return
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        result.errors.append(f"`{MANIFEST_ASSET}` is not valid JSON: {error}")
+        result.errors.append(f"`{manifest_asset}` is not valid JSON: {error}")
         return
     if not isinstance(manifest, dict):
-        result.errors.append(f"`{MANIFEST_ASSET}` is not a JSON object")
+        result.errors.append(f"`{manifest_asset}` is not a JSON object")
         return
     problems = schema_errors(load_schema("vendor/cmux-app.v2.schema.json"), manifest)
-    result.errors += [f"`{MANIFEST_ASSET}` {p}" for p in problems[:20]]
+    result.errors += [f"`{manifest_asset}` {p}" for p in problems[:20]]
     for problem in hidden_characters(manifest_raw.decode("utf-8", "replace")):
-        result.errors.append(f"`{MANIFEST_ASSET}` carries a hidden character ({problem})")
+        result.errors.append(f"`{manifest_asset}` carries a hidden character ({problem})")
     result.checked.append("manifest v2 schema")
 
     if manifest.get("id") != entry["id"]:
@@ -507,11 +511,11 @@ def check_extension(gh: GitHub, entry: dict, result: Result) -> None:
     if engines:
         result.glance.append(f"requires cmux {engines}")
 
-    check_package(gh, release, manifest, result)
+    check_package(gh, release, manifest_asset, manifest, result)
     check_readme(gh, owner, repo, tag, result)
 
 
-def check_package(gh: GitHub, release: dict, manifest: dict, result: Result) -> None:
+def check_package(gh: GitHub, release: dict, manifest_asset: str, manifest: dict, result: Result) -> None:
     try:
         raw = gh.download(asset_url(release, PACKAGE_ASSET), PACKAGE_LIMIT)
     except FetchError as error:
@@ -544,7 +548,7 @@ def check_package(gh: GitHub, release: dict, manifest: dict, result: Result) -> 
         result.errors.append(f"`{PACKAGE_ASSET}`: `{inner_name}` does not parse: {error}")
         return
     if inner != manifest:
-        result.errors.append(f"the package's `{inner_name}` differs from the release's `{MANIFEST_ASSET}`")
+        result.errors.append(f"the package's `{inner_name}` differs from the release's `{manifest_asset}`")
     result.checked.append("package manifest")
 
     files = [f.rstrip("/") for f in manifest.get("files") or [] if isinstance(f, str)]

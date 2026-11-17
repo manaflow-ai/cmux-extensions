@@ -64,16 +64,17 @@ def j(value) -> bytes:
     return json.dumps(value).encode()
 
 
-def extension_repo(manifest=MANIFEST, package=None, tag="v1.2.0", readme=b"# Focus\n![shot](s.png)\n"
+def extension_repo(manifest=MANIFEST, package=None, tag="v1.2.0", asset="cmux-app.v2.json", extra_assets=(), readme=b"# Focus\n![shot](s.png)\n"
                    b"[![Get it on cmux](https://cmux.com/extensions/badge.svg)](https://cmux.com/extensions/alice/cmux-focus)\n"):
     if package is None:
-        package = tarball({"cmux-app.v2.json": j(manifest), "dist/main.js": b"globalThis.x = 1;\n"})
+        package = tarball({asset: j(manifest), "dist/main.js": b"globalThis.x = 1;\n"})
     release = {
         "tag_name": tag,
         "draft": False,
         "prerelease": False,
         "assets": [
-            {"name": "cmux-app.v2.json", "browser_download_url": f"{DL}/m"},
+            *({"name": n, "browser_download_url": f"{DL}/other"} for n in extra_assets),
+            {"name": asset, "browser_download_url": f"{DL}/m"},
             {"name": "cmux-extension.tar.gz", "browser_download_url": f"{DL}/p"},
         ],
     }
@@ -110,6 +111,15 @@ class ExtensionTests(unittest.TestCase):
     def test_package_in_one_top_folder_passes(self):
         package = tarball({"cmux-app.v2.json": j(MANIFEST), "dist/main.js": b"1;\n"}, prefix="focus/")
         self.assertEqual(run(ENTRY, extension_repo(package=package)).errors, [])
+
+    def test_manifest_asset_named_cmux_app_json_passes(self):
+        result = run(ENTRY, extension_repo(asset="cmux-app.json", tag="1.2.0"))
+        self.assertEqual(result.errors, [])
+
+    def test_v2_asset_preferred_when_both(self):
+        # The other asset's URL is not served: reading it would fail the review.
+        responses = extension_repo(extra_assets=("cmux-app.json",))
+        self.assertEqual(run(ENTRY, responses).errors, [])
 
     def test_no_release(self):
         responses = {f"{API}/repos/alice/cmux-focus/releases?per_page=30": j([])}
