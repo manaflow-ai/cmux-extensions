@@ -12,5 +12,12 @@
     "author": "Manaflow",
     "description": "A dense, near-black workbench for agent chats: quiet chrome, compact rows, a boxed prompt. An example look built only from public cmux surfaces.",
     "repo": "manaflow-ai/cmux-studio-look"
+  },
+  {
+    "id": "manaflow-ai/paper-look",
+    "name": "Paper",
+    "author": "Manaflow",
+    "description": "A warm, roomy reading look for agent chats: serif replies on paper, soft rounded prompts. An example look built only from public cmux surfaces.",
+    "repo": "manaflow-ai/cmux-paper-look"
   }
 ]
