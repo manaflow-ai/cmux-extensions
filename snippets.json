@@ -1,1 +1,9 @@
-[]
+[
+  {
+    "id": "teamleaderleo/folio-type",
+    "name": "Folio Type",
+    "author": "teamleaderleo",
+    "description": "Bookish type for cmux: a warm grotesque for the chrome, a text serif for agent replies and Markdown, a clear mono for code. Three OFL fonts, inlined; colors stay yours.",
+    "repo": "teamleaderleo/folio-type"
+  }
+]
