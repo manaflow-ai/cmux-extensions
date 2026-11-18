@@ -5,5 +5,12 @@
     "author": "teamleaderleo",
     "description": "Teal and pink: a dark look on deep teal-black and a light look on pale mint-white, with ten original wallpapers that change every hour. WCAG AA text contrast.",
     "repo": "teamleaderleo/teal-twin-theme"
+  },
+  {
+    "id": "manaflow-ai/quillet",
+    "name": "Quillet",
+    "author": "Manaflow",
+    "description": "cmux's own type family for agent chats: Quillet Sans for the interface, Quillet Serif for replies, Quillet Mono for code. Type only, your colors stay; OFL fonts included.",
+    "repo": "manaflow-ai/cmux-quillet-look"
   }
 ]
