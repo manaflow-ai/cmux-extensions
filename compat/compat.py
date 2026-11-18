@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,8 @@ SETUP_FILE = "cmux-setup.json"
 # The crates the harness depends on; compat grows the sparse checkout from them.
 HARNESS_CRATES = ("cmux-customize", "cmux-config")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+BUILD_RE = re.compile(r"^[0-9]{1,20}$")
+VERSION_RE = re.compile(r"^[0-9A-Za-z.+-]{1,64}$")
 # A finding's setting, when its message names one.
 KEY_RE = re.compile(r"(?:the setting|value for) ([A-Za-z0-9_.\-]+)")
 SCHEMA = 1
@@ -81,9 +84,12 @@ def parse_feed(xml_text: str) -> list[dict]:
     builds = []
     for item in root.iter("item"):
         commit = (item.findtext(f"{{{CMUX_NS}}}sourceCommit") or "").strip().lower()
+        # The feed is remote text: a build is digits, a version a plain version string.
+        build = (item.findtext(f"{{{SPARKLE}}}version") or "").strip()
+        version = (item.findtext(f"{{{SPARKLE}}}shortVersionString") or "").strip()
         builds.append({
-            "build": (item.findtext(f"{{{SPARKLE}}}version") or "").strip(),
-            "version": (item.findtext(f"{{{SPARKLE}}}shortVersionString") or "").strip(),
+            "build": build if BUILD_RE.match(build) else "",
+            "version": version if VERSION_RE.match(version) else "",
             "sha": commit if SHA_RE.match(commit) else "",
             "published": (item.findtext("pubDate") or "").strip(),
         })
@@ -122,23 +128,45 @@ def workspace_paths(cmux_tui: Path) -> dict[str, str]:
     return found
 
 
-def crate_deps(manifest: Path) -> set[str]:
-    """Names a crate's [dependencies] (and target dependencies) take from the workspace."""
-    names = set()
-    in_deps = False
+def crate_deps(manifest: Path) -> tuple[set[str], set[str]]:
+    """A crate's non-dev dependencies: the names it takes from the workspace, and its own
+    `path = "..."` folders (relative to the crate). Reads `foo.workspace = true`,
+    `foo = { workspace = true }`, `foo = { path = ".." }` and `[dependencies.foo]` tables."""
+    names: set[str] = set()
+    paths: set[str] = set()
+    section = ""
+    table_dep = ""
     for line in manifest.read_text().splitlines():
-        stripped = line.strip()
+        stripped = line.split("#", 1)[0].strip()
         if stripped.startswith("["):
-            in_deps = stripped.endswith("dependencies]") and "dev-dependencies" not in stripped
+            section = stripped.strip("[]").strip()
+            table = re.match(r"(?:target\.[^\]]+\.)?(?:build-)?dependencies\.([A-Za-z0-9_-]+)$", section)
+            table_dep = table.group(1) if table else ""
             continue
-        if in_deps:
-            match = re.match(r"([A-Za-z0-9_-]+)(?:\.workspace\s*=\s*true|\s*=\s*\{[^}]*workspace\s*=\s*true)", stripped)
-            if match:
-                names.add(match.group(1))
-    return names
+        if table_dep:
+            if re.match(r"workspace\s*=\s*true", stripped):
+                names.add(table_dep)
+            path = re.match(r'path\s*=\s*"([^"]+)"', stripped)
+            if path:
+                paths.add(path.group(1))
+            continue
+        if not re.search(r"(?:^|\.)(?:build-)?dependencies$", section):
+            continue  # [dev-dependencies] and everything else
+        match = re.match(r"([A-Za-z0-9_-]+)(\.workspace\s*=\s*true|\s*=\s*\{.*\})", stripped)
+        if not match:
+            continue
+        if "workspace" in match.group(2) and re.search(r"workspace\s*=\s*true", match.group(2)):
+            names.add(match.group(1))
+        path = re.search(r'path\s*=\s*"([^"]+)"', match.group(2))
+        if path:
+            paths.add(path.group(1))
+    return names, paths
 
 
-INCLUDE_RE = re.compile(r'include_(?:str|bytes)!\(\s*(?:concat!\(\s*)?"([^"]+)"')
+# `include_str!("a")`, `include_str!(concat!("a", ...))` and
+# `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/a"))` (relative to the crate).
+INCLUDE_RE = re.compile(
+    r'include_(?:str|bytes)!\(\s*(?:concat!\(\s*)?(env!\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*)?"([^"]+)"')
 
 
 def needed_dirs(repo: Path, crate_dirs: set[str]) -> set[str]:
@@ -149,8 +177,10 @@ def needed_dirs(repo: Path, crate_dirs: set[str]) -> set[str]:
             if "tests" in source.relative_to(repo / crate).parts or source.name == "tests.rs":
                 continue
             for match in INCLUDE_RE.finditer(source.read_text(errors="replace")):
-                target = os.path.normpath(os.path.join(source.parent, match.group(1)))
-                folder = os.path.dirname(target) if not match.group(1).endswith("/") else target
+                literal = match.group(2)
+                base = repo / crate if match.group(1) else source.parent
+                target = os.path.normpath(os.path.join(base, literal.lstrip("/") if match.group(1) else literal))
+                folder = target if literal.endswith("/") else os.path.dirname(target)
                 rel = os.path.relpath(folder, repo)
                 if not rel.startswith(".."):
                     dirs.add(rel)
@@ -173,12 +203,18 @@ def checkout_source(sha: str, dest: Path, remote: str) -> Path:
             run(["git", "checkout", "-q", "--detach", sha], cwd=dest, timeout=900)
             first = False
         paths = workspace_paths(dest / "cmux-tui")
-        crates = {d for d in wanted if d.startswith("cmux-tui/crates/") and (dest / d / "Cargo.toml").exists()}
+        # Any folder with a Cargo.toml is a crate (the harness's, and whatever they depend on).
+        crates = {d for d in wanted if (dest / d / "Cargo.toml").is_file()}
         grown = set(wanted)
         for crate in crates:
-            for dep in crate_deps(dest / crate / "Cargo.toml"):
+            names, own_paths = crate_deps(dest / crate / "Cargo.toml")
+            for dep in names:
                 if dep in paths:
                     grown.add(os.path.normpath(f"cmux-tui/{paths[dep]}"))
+            for path in own_paths:
+                rel = os.path.normpath(os.path.join(crate, path))
+                if not rel.startswith(".."):
+                    grown.add(rel)
         grown |= needed_dirs(dest, crates)
         if grown == wanted:
             return dest
@@ -371,36 +407,56 @@ def check_entry(entry: dict, checker: dict, running: str, work: Path) -> dict | 
 # --- report -------------------------------------------------------------------------------
 
 
+# Run-specific text in a message (scratch folders, temp homes), so a signature stays the same.
+VOLATILE_RE = re.compile(r"(/[^\s'\"]*?(compat-home-|/work/|/tmp/)[^\s'\"]*)")
+
+
 def signature(finding: dict) -> str:
-    return finding.get("key") or finding.get("message", "")
+    """What makes a finding the same one next nightly: its code and setting, else its message."""
+    code = finding.get("code") or ""
+    if finding.get("key"):
+        return f"{code}:{finding['key']}"
+    return f"{code}:{VOLATILE_RE.sub('<path>', finding.get('message', ''))[:200]}"
 
 
 def diff(previous: dict | None, repos: list[dict]) -> dict:
-    """What changed since the last nightly's report: broke, new findings, fixed, added, removed."""
+    """What changed since the last nightly's report.
+
+    broke: a setup that fails now and passed (or was not there, or there is no previous report
+    at all: a first report raises every failure). new_findings: one that failed and fails in a
+    new way. errors: a setup that could not be checked (a clone or the checker failing); never
+    breakage, since a GitHub blip is not the nightly's doing."""
     before = {r["id"]: r for r in (previous or {}).get("repos", [])}
     now = {r["id"]: r for r in repos}
-    out = {"broke": [], "new_findings": {}, "fixed": [], "still_failing": [], "added": [], "removed": []}
+    out = {"broke": [], "new_findings": {}, "fixed": [], "still_failing": [], "errors": [],
+           "added": [], "removed": []}
     for rid, repo in now.items():
         old = before.get(rid)
-        failing = repo["status"] != "pass"
         if old is None:
             out["added"].append(rid)
-            if failing and previous is not None:
-                out["broke"].append(rid)
+        if repo["status"] == "error":
+            out["errors"].append(rid)
             continue
-        was_failing = old["status"] != "pass"
-        if failing and not was_failing:
+        old_status = old["status"] if old else "pass"
+        if repo["status"] == "fail" and old_status != "fail":
             out["broke"].append(rid)
-        elif not failing and was_failing:
+        elif repo["status"] == "pass" and old_status == "fail":
             out["fixed"].append(rid)
-        elif failing:
+        elif repo["status"] == "fail":
             seen = {signature(f) for f in old.get("findings", [])}
-            fresh = [signature(f) for f in repo["findings"] if signature(f) not in seen]
+            fresh = [f.get("key") or f.get("message", "") for f in repo["findings"] if signature(f) not in seen]
             if fresh:
                 out["new_findings"][rid] = fresh
             out["still_failing"].append(rid)
     out["removed"] = sorted(set(before) - set(now))
     return out
+
+
+def code_span(text: str) -> str:
+    """Text from cmux or a setup repo, shown inert: one line, in a code span (no mentions, links
+    or markup), at most 300 characters."""
+    flat = " ".join(str(text).split()).replace("`", "'")[:300]
+    return f"`{flat}`"
 
 
 def commit_link(sha: str) -> str:
@@ -425,8 +481,8 @@ def render(report: dict) -> str:
     def findings_block(repo: dict) -> list[str]:
         out = []
         for f in repo["findings"]:
-            key = f"`{f['key']}`: " if f.get("key") else ""
-            out.append(f"  - {key}{f['message']} ({', '.join(f['stages'])})")
+            key = f"{code_span(f['key'])}: " if f.get("key") else ""
+            out.append(f"  - {key}{code_span(f['message'])} ({', '.join(f['stages'])})")
         return out
 
     if changes["broke"] or changes["new_findings"]:
@@ -435,10 +491,16 @@ def render(report: dict) -> str:
             lines.append(f"- **{rid}** ([{by_id[rid]['repo']}](https://github.com/{by_id[rid]['repo']})) now fails:")
             lines += findings_block(by_id[rid])
         for rid, fresh in changes["new_findings"].items():
-            lines.append(f"- **{rid}** fails in a new way: " + ", ".join(f"`{s}`" for s in fresh))
+            lines.append(f"- **{rid}** fails in a new way: " + ", ".join(code_span(s) for s in fresh))
         lines.append("")
     if changes["fixed"]:
         lines += ["### Fixed since the previous nightly", ""] + [f"- {rid}" for rid in changes["fixed"]] + [""]
+    if changes.get("errors"):
+        lines += ["### Could not check (not counted as breakage)", ""]
+        for rid in changes["errors"]:
+            lines.append(f"- **{rid}**")
+            lines += findings_block(by_id[rid])
+        lines.append("")
 
     passed = sum(r["status"] == "pass" for r in repos)
     lines += [f"### Every published setup ({passed} of {len(repos)} pass)", "",
@@ -448,7 +510,7 @@ def render(report: dict) -> str:
         result = {"pass": "pass", "fail": f"fail ({len(r['findings'])})", "error": "error"}[r["status"]]
         lines.append(f"| {r['id']} | [{r['repo']}](https://github.com/{r['repo']}) | {commit} | {result} |")
     lines.append("")
-    failing = [r for r in repos if r["status"] != "pass"]
+    failing = [r for r in repos if r["status"] == "fail"]
     if failing:
         lines += ["### Findings", ""]
         for r in failing:
@@ -492,16 +554,26 @@ def write_outputs(path: str | None, values: dict) -> None:
     if path:
         with open(path, "a") as out:
             for key, value in values.items():
+                value = str(value)
+                if not re.fullmatch(r"[A-Za-z0-9_.+-]*", value):
+                    raise SystemExit(f"refusing to write output {key}: {value!r} is not a plain value")
                 out.write(f"{key}={value}\n")
 
 
 # --- commands -----------------------------------------------------------------------------
 
 
+def registry_hash(listed: list[dict]) -> str:
+    """The listed repos: a report is current only for this nightly and this list."""
+    text = json.dumps(sorted((e["repo"], e["path"], e["kind"]) for e in listed))
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
 def cmd_resolve(args) -> int:
     nightly = resolve(args.feed, args.sha or "")
     previous = load_previous(args.previous)
-    same = bool(previous) and previous["nightly"].get("sha") == nightly["sha"]
+    same = (bool(previous) and previous["nightly"].get("sha") == nightly["sha"]
+            and previous.get("registry") == registry_hash(entries(Path(args.registry))))
     print(json.dumps(nightly))
     write_outputs(args.github_output, {"sha": nightly["sha"], "build": nightly["build"],
                                        "already_checked": str(same).lower()})
@@ -533,13 +605,21 @@ def cmd_run(args) -> int:
     checker["running_version"] = running
 
     repos = []
-    for entry in entries(Path(args.registry)):
+    listed = entries(Path(args.registry))
+    for entry in listed:
         log(f"checking {entry['repo']}")
-        result = check_entry(entry, checker, running, work)
+        try:
+            result = check_entry(entry, checker, running, work)
+        except subprocess.TimeoutExpired as error:
+            result = {"id": entry["id"], "name": entry["name"], "repo": entry["repo"], "kind": entry["kind"],
+                      "status": "error", "commit": "", "findings": [{
+                          "stages": ["check"], "code": "timeout", "key": None,
+                          "message": f"{Path(str(error.cmd[0])).name} took longer than {error.timeout:.0f} s"}]}
         if result is not None:
             repos.append(result)
     report = build_report(nightly, {k: v for k, v in checker.items() if k != "binary"},
                           repos, load_previous(args.previous))
+    report["registry"] = registry_hash(listed)
     Path(args.out_json).write_text(json.dumps(report, indent=2) + "\n")
     Path(args.out_md).write_text(render(report) + "\n")
     changes = report["diff"]
@@ -558,6 +638,7 @@ def main(argv: list[str] | None = None) -> int:
     resolve_p = sub.add_parser("resolve", help="print the nightly to check")
     resolve_p.add_argument("--sha", help="a nightly commit (default: the newest feed build)")
     resolve_p.add_argument("--previous", help="the previous report: already_checked when it is this nightly")
+    resolve_p.add_argument("--registry", default=str(REGISTRY))
     resolve_p.add_argument("--github-output")
     run_p = sub.add_parser("run", help="check every published setup and write the report")
     run_p.add_argument("--sha", help="a nightly commit (default: the newest feed build)")
