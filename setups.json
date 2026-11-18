@@ -5,5 +5,12 @@
     "author": "Manaflow",
     "description": "A dusk theme, a hello action and the sample extension, in one install. The sample setup.",
     "repo": "manaflow-ai/cmux-setup-sample"
+  },
+  {
+    "id": "manaflow-ai/studio-look",
+    "name": "Studio",
+    "author": "Manaflow",
+    "description": "A dense, near-black workbench for agent chats: quiet chrome, compact rows, a boxed prompt. An example look built only from public cmux surfaces.",
+    "repo": "manaflow-ai/cmux-studio-look"
   }
 ]
