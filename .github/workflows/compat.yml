@@ -1,0 +1,144 @@
+# Customization compat: every published setup in this registry, checked against each cmux NEXT
+# nightly before people install it there (compat/compat.py). The nightly and its commit come from
+# the public feed; the check is built from that commit's source unless the nightly publishes a
+# Linux cmux with `cmux setup check`. The report is the job summary and the `compat-report`
+# artifact, diffed against the last nightly's; new breakage opens or updates one issue here.
+name: Customization compat
+
+on:
+  # The feed takes new nightlies through the day. A run whose nightly has a report already
+  # stops after one feed read.
+  schedule:
+    - cron: "23 */2 * * *"
+  # For a nightly publisher that wants to say so at once (client_payload.sha optional).
+  repository_dispatch:
+    types: [cmux-nightly-published]
+  workflow_dispatch:
+    inputs:
+      nightly_sha:
+        description: A nightly's cmux commit (40 hex). Empty is the newest build in the feed.
+        required: false
+        default: ""
+      force:
+        description: Check even when this nightly has a report already.
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - compat/**
+      - .github/workflows/compat.yml
+      - setups.json
+      - extensions.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'nightly' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # Reading the last report (an artifact of an earlier run).
+      actions: read
+      # One issue for new breakage. A token without it only logs that it could not.
+      issues: write
+    env:
+      NIGHTLY_SHA: ${{ github.event.inputs.nightly_sha || github.event.client_payload.sha || '' }}
+      FORCE: ${{ github.event.inputs.force || 'false' }}
+    steps:
+      - name: Check out the registry
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Compat script tests
+        run: python3 -m unittest discover -s compat/tests
+
+      - name: The previous report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The newest successful nightly run's report (pull request runs never count).
+          mkdir -p "$RUNNER_TEMP/previous"
+          run=$(gh run list -R "$GITHUB_REPOSITORY" --workflow compat.yml --branch main --status success \
+            --limit 30 --json databaseId,event \
+            --jq '[.[] | select(.event != "pull_request")][0].databaseId // empty' || true)
+          if [ -n "$run" ] && gh run download "$run" -R "$GITHUB_REPOSITORY" -n compat-report \
+               -D "$RUNNER_TEMP/previous"; then
+            echo "previous report: run $run"
+          else
+            echo "no previous report"
+          fi
+
+      - name: Resolve the nightly
+        id: nightly
+        run: |
+          case "$NIGHTLY_SHA" in (''|[0-9a-f]*) ;; (*) echo "nightly_sha must be 40 hex"; exit 1;; esac
+          python3 compat/compat.py resolve ${NIGHTLY_SHA:+--sha "$NIGHTLY_SHA"} \
+            --previous "$RUNNER_TEMP/previous/compat-report.json" --github-output "$GITHUB_OUTPUT"
+
+      - name: Nothing new
+        if: steps.nightly.outputs.already_checked == 'true' && env.FORCE != 'true' && github.event_name != 'pull_request'
+        run: |
+          echo "Nightly ${{ steps.nightly.outputs.build }} (${{ steps.nightly.outputs.sha }}) has a report already." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cargo cache
+        id: cache
+        if: steps.nightly.outputs.already_checked != 'true' || env.FORCE == 'true' || github.event_name == 'pull_request'
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/target
+          key: compat-${{ runner.os }}-${{ steps.nightly.outputs.sha }}
+          restore-keys: compat-${{ runner.os }}-
+
+      - name: Check every published setup
+        id: run
+        if: steps.cache.outcome == 'success'
+        env:
+          SHA: ${{ steps.nightly.outputs.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/report"
+          python3 compat/compat.py run --sha "$SHA" --work "$RUNNER_TEMP/work" \
+            --target-dir "$RUNNER_TEMP/target" --previous "$RUNNER_TEMP/previous/compat-report.json" \
+            --out-json "$RUNNER_TEMP/report/compat-report.json" --out-md "$RUNNER_TEMP/report/compat-report.md" \
+            --github-output "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/report/compat-report.md" >> "$GITHUB_STEP_SUMMARY"
+          printf '\n<sub>[Run](%s)</sub>\n' "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            >> "$RUNNER_TEMP/report/compat-report.md"
+
+      - name: Upload the report
+        if: steps.run.outcome == 'success'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: compat-report
+          path: |
+            ${{ runner.temp }}/report/compat-report.json
+            ${{ runner.temp }}/report/compat-report.md
+          retention-days: 90
+
+      - name: Open or update the breakage issue
+        if: steps.run.outputs.new_breakage == 'true' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # One open issue, found by its marker; each new breakage is a comment on it.
+          title="Customization compat: a published setup breaks on a cmux NEXT nightly"
+          body="$RUNNER_TEMP/report/compat-report.md"
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
+            --json number,title --jq "[.[] | select(.title == \"$title\")][0].number // empty" || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body-file "$body" \
+              || echo "::warning::could not comment on #$existing (the token may lack issues: write)"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file "$body" \
+              || echo "::warning::could not open the issue (the token may lack issues: write)"
+          fi
