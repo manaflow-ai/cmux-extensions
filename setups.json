@@ -19,5 +19,12 @@
     "author": "Manaflow",
     "description": "A warm, roomy reading look for agent chats: serif replies on paper, soft rounded prompts. An example look built only from public cmux surfaces.",
     "repo": "manaflow-ai/cmux-paper-look"
+  },
+  {
+    "id": "manaflow-ai/newtab-console-look",
+    "name": "Console New Tab",
+    "author": "cmux",
+    "description": "A monospace field behind a > prompt, Recently Closed, then every chat as plain lines with a filter and a search: the Console New Tab page, rebuilt as a look on public cmux surfaces.",
+    "repo": "manaflow-ai/cmux-newtab-console-look"
   }
 ]
