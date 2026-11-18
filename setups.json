@@ -19,5 +19,12 @@
     "author": "Manaflow",
     "description": "A warm, roomy reading look for agent chats: serif replies on paper, soft rounded prompts. An example look built only from public cmux surfaces.",
     "repo": "manaflow-ai/cmux-paper-look"
+  },
+  {
+    "id": "manaflow-ai/newtab-threads-look",
+    "name": "Threads New Tab",
+    "author": "cmux",
+    "description": "The field on top, Recently Closed under it, then every chat as a quiet list with Chats and Projects, a filter and a search: the Threads New Tab page, rebuilt as a look on public cmux surfaces.",
+    "repo": "manaflow-ai/cmux-newtab-threads-look"
   }
 ]
