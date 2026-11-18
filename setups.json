@@ -19,5 +19,12 @@
     "author": "Manaflow",
     "description": "A warm, roomy reading look for agent chats: serif replies on paper, soft rounded prompts. An example look built only from public cmux surfaces.",
     "repo": "manaflow-ai/cmux-paper-look"
+  },
+  {
+    "id": "manaflow-ai/quillet-look",
+    "name": "Quillet",
+    "author": "Manaflow",
+    "description": "cmux's own type family for agent chats as a setup: Quillet Sans, Serif and Mono, set for 15 px prose at a 1.6 line height. OFL fonts included.",
+    "repo": "manaflow-ai/cmux-quillet-look"
   }
 ]
