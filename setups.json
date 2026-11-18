@@ -19,5 +19,12 @@
     "author": "Manaflow",
     "description": "A warm, roomy reading look for agent chats: serif replies on paper, soft rounded prompts. An example look built only from public cmux surfaces.",
     "repo": "manaflow-ai/cmux-paper-look"
+  },
+  {
+    "id": "manaflow-ai/newtab-cards-look",
+    "name": "Cards New Tab",
+    "author": "cmux",
+    "description": "One rounded field, the folder and agent under it, and your three most recent chats as cards: the Cards New Tab page, rebuilt as a look on public cmux surfaces.",
+    "repo": "manaflow-ai/cmux-newtab-cards-look"
   }
 ]
