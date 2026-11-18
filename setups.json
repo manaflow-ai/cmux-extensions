@@ -19,5 +19,12 @@
     "author": "Manaflow",
     "description": "A warm, roomy reading look for agent chats: serif replies on paper, soft rounded prompts. An example look built only from public cmux surfaces.",
     "repo": "manaflow-ai/cmux-paper-look"
+  },
+  {
+    "id": "manaflow-ai/newtab-default-look",
+    "name": "Default New Tab",
+    "author": "cmux",
+    "description": "Where the chat starts and what needs you, over the composer; your five latest chats as quiet rows: the Default New Tab page, rebuilt as a look on public cmux surfaces.",
+    "repo": "manaflow-ai/cmux-newtab-default-look"
   }
 ]
