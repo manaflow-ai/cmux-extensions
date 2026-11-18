@@ -291,6 +291,15 @@ class SnippetTests(unittest.TestCase):
         result = run(self.ENTRY, self.repo(files=files), "snippets.json")
         self.assertTrue(any("nothing from the network" in e for e in result.errors))
 
+    def test_stylesheet_up_to_cmux_limit_passes(self):
+        # An inlined font: as cmux reads it (MAX_SNIPPET_FILE_BYTES, 256 KiB).
+        css = b"@font-face { font-family: F; src: url(data:font/woff2;base64," + b"A" * (180 * 1024) + b") }"
+        result = run(self.ENTRY, self.repo(files={"agent-pane/theme.css": css}), "snippets.json")
+        self.assertEqual(result.errors, [])
+        too_big = b"a{}" + b" " * (256 * 1024)
+        result = run(self.ENTRY, self.repo(files={"agent-pane/theme.css": too_big}), "snippets.json")
+        self.assertTrue(any("larger than 256 KiB" in e for e in result.errors))
+
     def test_inline_stylesheet_import_refused(self):
         marker = {**self.MARKER, "files": {"diff/theme.css": "@import 'x.css';"}}
         result = run(self.ENTRY, self.repo(marker=marker), "snippets.json")
