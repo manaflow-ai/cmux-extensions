@@ -94,6 +94,27 @@ The comment lists, for each entry, what a person should look at before merging:
 A merge into `main` is the approval. A listed item's new releases are not reviewed again here: cmux's
 consent card shows every scope on install, and asks again when an update adds one.
 
+## Compatibility with each nightly
+
+cmux keeps changing after an item is listed: a setting can be renamed or retired, a value can stop
+being accepted. [`Customization compat`](.github/workflows/compat.yml) checks every listed setup (the
+`setups.json` entries, and any `extensions.json` repo with a `cmux-setup.json`) against each cmux NEXT
+nightly, before people install them there ([`compat/compat.py`](compat/compat.py)):
+
+- it reads the newest nightly and its commit from the public feed, every two hours (a run with
+  nothing new stops there), or the commit a manual run names;
+- it checks each setup the way `cmux setup install` does, with that commit's own code: a Linux
+  `cmux setup check` when the nightly publishes one, else a small check
+  ([`compat/harness`](compat/harness/src/main.rs)) built from that commit's `cmux-customize` and
+  `cmux-config` crates, which installs each setup into an empty home and lists every setting the
+  nightly refuses, with the setting that replaced a renamed one and the reason one was retired;
+- it writes the report as the run summary and the `compat-report` artifact (JSON and Markdown),
+  compared with the previous nightly's: new breakage first, then every setup, then what was fixed;
+- new breakage opens one issue here, or comments on it while it is open.
+
+Repos are cloned and read, never run. A pull request that changes the listings or the check runs it
+too, against the newest nightly.
+
 ## Get it on cmux badge
 
 Put this in your README (replace `OWNER/REPO`):
