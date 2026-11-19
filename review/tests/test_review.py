@@ -479,36 +479,31 @@ class SetupOnNightlyTests(unittest.TestCase):
         self.assertEqual(result.errors, [])
         self.assertTrue(any(OLDER in c for c in result.checked))
 
-    def test_checker_reads_the_schema_samples_as_cmux_does(self):
-        gh = FakeGitHub(nightly())
-        self.assertEqual(review.checker_drift(review.load_cmux_target(gh)), [])
+    def test_a_row_this_review_reads_differently_is_a_warning(self):
+        self.assertEqual([review.row_drift(row) for row in ROWS], [None] * len(ROWS))
         odd = [*ROWS, {"key": "x.new", "kind": "brand_new_kind", "agent_settable": True, "validation": "portable"},
                {"key": "x.width", "kind": "number", "agent_settable": True, "validation": "portable",
                 "range": {"min": 0, "max": 10}, "accepts": [20]}]
-        drift = review.checker_drift(review.load_cmux_target(FakeGitHub(nightly(rows=odd))))
-        self.assertEqual(len(drift), 2, drift)
+        result = self.check({"x.new": "anything", "x.width": 20}, rows=odd)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any("`x.new`" in w and "new to this review" in w for w in result.warnings))
+        self.assertTrue(any("`x.width`" in w and "KIND_ACCEPTS" in w for w in result.warnings))
 
-    def test_compat_run_over_setups_json(self):
+    def test_added_setup_in_the_review_comment(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root, base = Path(tmp) / "root", Path(tmp) / "base"
+            root.mkdir()
+            base.mkdir()
             for name in review.KINDS:
                 (root / name).write_text(json.dumps([self.ENTRY] if name == "setups.json" else []))
-            out = root / "report.md"
+                (base / name).write_text("[]")
+            out = Path(tmp) / "comment.md"
             files = {**self.repo({"sidebar.look": "claude"}), **nightly()}
-            code = review.main(["--root", str(root), "--setups-compat", "--out", str(out), "--quiet"], gh=FakeGitHub(files))
+            code = review.main(["--root", str(root), "--base-dir", str(base), "--out", str(out), "--quiet"], gh=FakeGitHub(files))
             text = out.read_text()
             self.assertEqual(code, 1)
-            self.assertIn("vs the cmux nightly: FAIL", text)
-            self.assertIn(f"manaflow-ai/cmux@{NIGHTLY}", text)
             self.assertIn("### FAIL: `alice/look`", text)
-            self.assertNotIn("README", text)
-            files = {**self.repo({"sidebar.density": "compact"}), **nightly()}
-            code = review.main(["--root", str(root), "--setups-compat", "--out", str(out), "--quiet"], gh=FakeGitHub(files))
-            self.assertEqual(code, 0)
-            self.assertIn("PASS", out.read_text())
-            code = review.main(["--root", str(root), "--setups-compat", "--out", str(out), "--quiet"], gh=FakeGitHub(self.repo({})))
-            self.assertEqual(code, 2)
-            self.assertIn("NOT RUN", out.read_text())
+            self.assertIn("`sidebar.look` is not one the cmux nightly 1.0.0-nightly.4427140699701", text)
 
 
 class FileTests(unittest.TestCase):

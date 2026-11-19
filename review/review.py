@@ -18,12 +18,10 @@ a pull request adds or changes, fetches what the entry points at:
 
 Writes a Markdown summary (the PR comment) and exits 1 when any check fails.
 
-    python3 review/review.py --root . --base-dir BASE [--all] [--out comment.md]
-    python3 review/review.py --root . --setups-compat [--cmux-ref SHA] [--out report.md]
+    python3 review/review.py --root . --base-dir BASE [--all] [--cmux-ref SHA] [--out comment.md]
 
-BASE holds the base branch's copies of the entry files (a missing file is empty).
-`--setups-compat` checks every listed setup against the nightly (or `--cmux-ref`), what the
-nightly compatibility workflow runs.
+BASE holds the base branch's copies of the entry files (a missing file is empty). `--cmux-ref`
+checks setups against that cmux commit instead of the newest nightly.
 """
 
 from __future__ import annotations
@@ -1019,23 +1017,21 @@ def value_accepted(row: dict, value) -> bool | None:
     return None if check is None else bool(check(row, value))
 
 
-def checker_drift(target: CmuxTarget) -> list[str]:
-    """Rows whose own `accepts` and `refuses` samples this checker reads differently: the
-    detector for a kind or rule cmux added after this file was written."""
-    drift = []
-    for key, row in target.rows.items():
-        if row.get("kind") not in KIND_ACCEPTS:
-            drift.append(f"`{key}`: kind `{row.get('kind')}` is not one this review knows; its values are not checked")
-            continue
-        if str(row.get("validation", "portable")).startswith("domain:"):
-            continue
-        for sample in row.get("accepts") or []:
-            if value_accepted(row, sample) is False:
-                drift.append(f"`{key}`: the schema accepts {json.dumps(sample)}, this review refuses it")
-        for sample in row.get("refuses") or []:
-            if value_accepted(row, sample) is True and row.get("kind") not in ("url", "theme", "font_family", "sound"):
-                drift.append(f"`{key}`: the schema refuses {json.dumps(sample)}, this review accepts it")
-    return drift
+def row_drift(row: dict) -> str | None:
+    """Why this review cannot judge the row's values, or None: a kind it does not know, or one of
+    the row's own `accepts` or `refuses` samples it reads differently from cmux. The detector for a
+    kind or rule cmux added after this file was written; such a value is a warning, not a FAIL."""
+    if row.get("kind") not in KIND_ACCEPTS:
+        return f"its kind `{row.get('kind')}` is new to this review"
+    if str(row.get("validation", "portable")).startswith("domain:"):
+        return None
+    for sample in row.get("accepts") or []:
+        if value_accepted(row, sample) is False:
+            return f"this review refuses {json.dumps(sample)}, which the schema accepts"
+    for sample in row.get("refuses") or []:
+        if value_accepted(row, sample) is True and row.get("kind") not in ("url", "theme", "font_family", "sound"):
+            return f"this review accepts {json.dumps(sample)}, which the schema refuses"
+    return None
 
 
 def check_setup_settings(target: CmuxTarget, settings: dict, result: Result) -> None:
@@ -1066,8 +1062,11 @@ def check_setup_settings(target: CmuxTarget, settings: dict, result: Result) -> 
         if not row.get("agent_settable", False):
             result.errors.append(f"setting `{key}` is one only the person can change: {on} refuses a setup that sets it")
             continue
-        accepted = value_accepted(row, value)
-        if accepted is False:
+        drift = row_drift(row)
+        if drift:
+            result.warnings.append(f"setting `{key}`: its value is not checked here, because {drift} (update `KIND_ACCEPTS` in review/review.py)")
+            continue
+        if value_accepted(row, value) is False:
             shown = json.dumps(value)
             shown = shown if len(shown) <= 60 else shown[:57] + "..."
             hint = f"; one of {', '.join(_choices(row)[:12])}" if row.get("kind") == "choice" else ""
@@ -1188,55 +1187,6 @@ def render(file_errors: list[str], results: list[Result], removed: list[tuple[st
     return "\n".join(lines) + "\n"
 
 
-def setups_compat(gh: GitHub, entries: dict[str, list]) -> tuple[str, int]:
-    """Every listed setup against the nightly: the report and the exit code (0 all install,
-    1 one or more would be refused, 2 the nightly could not be read)."""
-    lines = ["<!-- cmux-setups-compat -->"]
-    try:
-        target = load_cmux_target(gh)
-    except (NotFound, FetchError) as error:
-        lines += ["## Listed setups vs the cmux nightly: NOT RUN", "", f"Could not read the nightly: {error}", ""]
-        return "\n".join(lines) + "\n", 2
-    results = []
-    for entry in entries["setups.json"]:
-        result = Result("setups.json", entry, "listed")
-        result.errors += owner_errors(entry)
-        if not result.errors:
-            try:
-                check_setup(gh, entry, result, readme=False)
-            except NotFound as error:
-                result.errors.append(f"not found: {error} (is the repo public?)")
-            except FetchError as error:
-                result.errors.append(f"could not fetch: {error}")
-        results.append(result)
-    failed = [r for r in results if not r.ok]
-    verdict = "FAIL" if failed else "PASS"
-    lines += [f"## Listed setups vs the cmux nightly: {verdict}", ""]
-    lines.append(f"Target: {target.label}, `{CMUX_REPO}@{target.ref}`. " + (
-        "A key this cmux lacks is left out at install (a warning)." if target.skips_unknown
-        else "This cmux refuses a whole setup for one key it lacks (an error)."
-    ))
-    lines.append(f"{len(results)} setups, {len(failed)} would not install.")
-    lines.append("")
-    for r in results:
-        lines.append(f"### {'PASS' if r.ok else 'FAIL'}: `{r.entry.get('id')}`")
-        lines.append(f"Repo: {r.entry.get('repo')}" + (f", path `{r.entry['path']}`" if r.entry.get("path") else ""))
-        if r.checked:
-            lines.append(f"Checked: {', '.join(r.checked)}")
-        lines += [f"- FAIL: {e}" for e in r.errors]
-        lines += [f"- WARN: {w}" for w in r.warnings]
-        lines.append("")
-    drift = checker_drift(target)
-    if drift:
-        lines.append("### This review's value checks vs the nightly's schema")
-        lines.append("Rows whose own samples this review reads differently; update `KIND_ACCEPTS` in review/review.py:")
-        lines += [f"- WARN: {d}" for d in drift[:40]]
-        if len(drift) > 40:
-            lines.append(f"- and {len(drift) - 40} more")
-        lines.append("")
-    return "\n".join(lines) + "\n", 1 if failed else 0
-
-
 def main(argv: list[str] | None = None, gh: GitHub | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", type=Path, default=HERE.parent)
@@ -1244,7 +1194,6 @@ def main(argv: list[str] | None = None, gh: GitHub | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="fetch and check every entry, not only added or changed ones")
     parser.add_argument("--out", type=Path, help="write the Markdown summary here")
     parser.add_argument("--quiet", action="store_true", help="do not print the summary")
-    parser.add_argument("--setups-compat", action="store_true", help="check every listed setup against the cmux nightly")
     parser.add_argument("--cmux-ref", help="check setups against this cmux commit, not the newest nightly")
     args = parser.parse_args(argv)
 
@@ -1252,16 +1201,6 @@ def main(argv: list[str] | None = None, gh: GitHub | None = None) -> int:
     if args.cmux_ref:
         gh.cmux_ref = args.cmux_ref
     entries, file_errors = load_entries(args.root)
-    if args.setups_compat:
-        report, code = setups_compat(gh, entries)
-        if file_errors:
-            report += "\n### Entry files\n" + "".join(f"- FAIL: {e}\n" for e in file_errors)
-            code = max(code, 1)
-        if args.out:
-            args.out.write_text(report)
-        if not args.quiet:
-            sys.stdout.write(report)
-        return code
     file_errors += file_checks(entries)
     changes, removed = diff(entries, load_base(args.base_dir))
     results = [

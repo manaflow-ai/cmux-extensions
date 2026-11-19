@@ -99,13 +99,6 @@ The comment lists, for each entry, what a person should look at before merging:
 A merge into `main` is the approval. A listed item's new releases are not reviewed again here: cmux's
 consent card shows every scope on install, and asks again when an update adds one.
 
-## After each cmux nightly
-
-[`Setups vs the cmux nightly`](.github/workflows/setups-compat.yml) runs the setup checks above over
-every entry in `setups.json` after each nightly (`review.py --setups-compat`), so a listed setup
-that a new cmux would refuse shows up the day it changes. It gates nothing: the report is in the
-run's summary, and on one open issue while a listed setup would not install.
-
 ## Get it on cmux badge
 
 Put this in your README (replace `OWNER/REPO`):
