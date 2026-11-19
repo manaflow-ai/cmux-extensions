@@ -351,6 +351,166 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(any("differs from the entry id" in e for e in result.errors))
 
 
+NIGHTLY = "a" * 40
+OLDER = "b" * 40
+
+
+def appcast(*items):
+    body = "".join(
+        f"<item><sparkle:version>{build}</sparkle:version>"
+        f"<sparkle:shortVersionString>1.0.0-nightly.{build}</sparkle:shortVersionString>"
+        f'<cmux:sourceCommit xmlns:cmux="https://cmux.com/xml-namespaces/cmux">{sha}</cmux:sourceCommit></item>'
+        for build, sha in items
+    )
+    return f"<rss><channel>{body}</channel></rss>".encode()
+
+
+ROWS = [
+    {"key": "sidebar.density", "kind": "choice", "agent_settable": True, "validation": "portable",
+     "choices": [{"value": "compact"}, {"value": "comfortable"}], "accepts": ["compact"], "refuses": ["tiny", 1]},
+    {"key": "agentPane.display.width", "kind": "number", "agent_settable": True, "validation": "portable",
+     "range": {"min": 480, "max": 1400, "step": 10}, "accepts": [480, 736], "refuses": [100, "760", True]},
+    {"key": "appearance.themeFile", "kind": "text", "agent_settable": True, "validation": "portable",
+     "accepts": ["studio"], "refuses": [1]},
+    {"key": "sidebar.workspaceRow.icon", "kind": "toggle", "agent_settable": True, "validation": "portable",
+     "accepts": [True, False], "refuses": ["true", 1]},
+    {"key": "remote.ultra", "kind": "choice", "agent_settable": True, "validation": "portable",
+     "choices": [{"value": "off"}, {"value": "auto"}, {"value": "always"}], "accepts": ["auto"], "refuses": [True]},
+    {"key": "history.terminalCommands", "kind": "toggle", "agent_settable": False, "validation": "portable",
+     "accepts": [True], "refuses": [1]},
+]
+RETIRED = {"retired": [{"key": "remote.ultraMode", "reason": "now remote.ultra", "replaced_by": "remote.ultra",
+                        "values": [{"from": True, "to": "always"}]}]}
+TOKENS = {"interface": "cmux.agentPane.style/1", "tokens": [
+    {"name": "--cv-text", "kind": "color"},
+    {"name": "--cv-old-tint", "kind": "color", "replacedBy": "--cv-user-bubble-tint"},
+]}
+
+
+def nightly(rows=ROWS, tokens=None, skips_unknown=False, sha=NIGHTLY):
+    at = f"https://raw.githubusercontent.com/manaflow-ai/cmux/{sha}/"
+    files = {
+        review.NIGHTLY_APPCASTS[0]: appcast((4427140699701, sha), (4424316677601, OLDER)),
+        at + review.SETTINGS_SCHEMA: j({"version": 1, "rows": rows}),
+        at + review.RETIRED_KEYS: j(RETIRED),
+    }
+    if tokens is not None:
+        files[at + review.STYLE_TOKENS] = j(tokens)
+    if skips_unknown:
+        files[at + review.PUBLISHED_KEYS] = b"sidebar.density\n"
+    return files
+
+
+class SetupOnNightlyTests(unittest.TestCase):
+    ENTRY = {**ENTRY, "id": "alice/look", "repo": "alice/look"}
+
+    def repo(self, settings, css=None):
+        setup = {"cmuxSetup": 1, "id": "alice/look", "name": "Look", "description": "A look.", "version": "1.0.0",
+                 "cmuxProfile": 1, "settings": settings}
+        files = {
+            f"{API}/repos/alice/look/releases/latest": j({"tag_name": "v1.0.0"}),
+            raw("alice", "look", "cmux-setup.json", "v1.0.0"): j(setup),
+            **readme_at("alice", "look", "v1.0.0"),
+        }
+        if css is not None:
+            files[raw("alice", "look", "agent-pane/theme.css", "v1.0.0")] = css.encode()
+        return files
+
+    def check(self, settings, css=None, **target):
+        return run(self.ENTRY, {**self.repo(settings, css), **nightly(**target)}, "setups.json")
+
+    def test_newest_nightly_is_the_target(self):
+        sha, version = review.nightly_commit(FakeGitHub(nightly()))
+        self.assertEqual((sha, version), (NIGHTLY, "1.0.0-nightly.4427140699701"))
+
+    def test_setup_the_nightly_takes_passes(self):
+        result = self.check({"sidebar.density": "compact", "agentPane.display.width": 736,
+                             "appearance.themeFile": "studio", "sidebar.workspaceRow.icon": False})
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any("1.0.0-nightly.4427140699701" in c for c in result.checked))
+
+    def test_unknown_key_refuses_until_the_nightly_skips_it(self):
+        result = self.check({"sidebar.look": "claude"})
+        self.assertTrue(any("`sidebar.look` is not one" in e and "refuses the whole setup" in e for e in result.errors))
+        result = self.check({"sidebar.look": "claude"}, skips_unknown=True)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any("`sidebar.look`" in w and "leaves it out" in w for w in result.warnings))
+
+    def test_renamed_key(self):
+        result = self.check({"remote.ultraMode": True})
+        self.assertTrue(any("renamed to `remote.ultra`" in e for e in result.errors))
+        result = self.check({"remote.ultraMode": True}, skips_unknown=True)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any("set `remote.ultra`" in w for w in result.warnings))
+
+    def test_values_the_row_refuses(self):
+        result = self.check({"sidebar.density": "tiny", "agentPane.display.width": 2000,
+                             "sidebar.workspaceRow.icon": "false", "appearance.themeFile": 3})
+        self.assertEqual(len(result.errors), 4, result.errors)
+        self.assertTrue(any("one of compact, comfortable" in e for e in result.errors))
+        self.assertTrue(any("480 to 1400" in e for e in result.errors))
+        self.assertEqual(self.check({"agentPane.display.width": True}).ok, False)
+
+    def test_key_only_the_person_sets(self):
+        result = self.check({"history.terminalCommands": True})
+        self.assertTrue(any("only the person can change" in e for e in result.errors))
+
+    def test_stylesheet_tokens(self):
+        css = ":root {\n  --cv-text: #eee;\n  --cv-old-tint: #333;\n  /* --cv-commented: 1px; */\n  --cv-made-up: red;\n}\n"
+        result = self.check({}, css=css, tokens=TOKENS)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any("`--cv-made-up`" in w and "paints nothing" in w for w in result.warnings))
+        self.assertTrue(any("renamed to `--cv-user-bubble-tint`" in w for w in result.warnings))
+        self.assertFalse(any("--cv-text`" in w or "--cv-commented" in w for w in result.warnings))
+        result = self.check({}, css=css)
+        self.assertTrue(any("publishes no" in w for w in result.warnings))
+
+    def test_unreadable_nightly_is_a_warning_in_review(self):
+        result = run(self.ENTRY, self.repo({"sidebar.look": "x"}), "setups.json")
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any("could not read the cmux nightly" in w for w in result.warnings))
+
+    def test_cmux_ref_overrides_the_nightly(self):
+        files = {**self.repo({"sidebar.density": "compact"}), **nightly(sha=OLDER)}
+        del files[review.NIGHTLY_APPCASTS[0]]
+        gh = FakeGitHub(files)
+        gh.cmux_ref = OLDER
+        result = review.review_entry(gh, "setups.json", self.ENTRY, "added")
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any(OLDER in c for c in result.checked))
+
+    def test_checker_reads_the_schema_samples_as_cmux_does(self):
+        gh = FakeGitHub(nightly())
+        self.assertEqual(review.checker_drift(review.load_cmux_target(gh)), [])
+        odd = [*ROWS, {"key": "x.new", "kind": "brand_new_kind", "agent_settable": True, "validation": "portable"},
+               {"key": "x.width", "kind": "number", "agent_settable": True, "validation": "portable",
+                "range": {"min": 0, "max": 10}, "accepts": [20]}]
+        drift = review.checker_drift(review.load_cmux_target(FakeGitHub(nightly(rows=odd))))
+        self.assertEqual(len(drift), 2, drift)
+
+    def test_compat_run_over_setups_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in review.KINDS:
+                (root / name).write_text(json.dumps([self.ENTRY] if name == "setups.json" else []))
+            out = root / "report.md"
+            files = {**self.repo({"sidebar.look": "claude"}), **nightly()}
+            code = review.main(["--root", str(root), "--setups-compat", "--out", str(out), "--quiet"], gh=FakeGitHub(files))
+            text = out.read_text()
+            self.assertEqual(code, 1)
+            self.assertIn("vs the cmux nightly: FAIL", text)
+            self.assertIn(f"manaflow-ai/cmux@{NIGHTLY}", text)
+            self.assertIn("### FAIL: `alice/look`", text)
+            self.assertNotIn("README", text)
+            files = {**self.repo({"sidebar.density": "compact"}), **nightly()}
+            code = review.main(["--root", str(root), "--setups-compat", "--out", str(out), "--quiet"], gh=FakeGitHub(files))
+            self.assertEqual(code, 0)
+            self.assertIn("PASS", out.read_text())
+            code = review.main(["--root", str(root), "--setups-compat", "--out", str(out), "--quiet"], gh=FakeGitHub(self.repo({})))
+            self.assertEqual(code, 2)
+            self.assertIn("NOT RUN", out.read_text())
+
+
 class FileTests(unittest.TestCase):
     def write(self, root: Path, **files):
         for name in review.KINDS:
