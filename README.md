@@ -53,6 +53,44 @@ Edit your entry only to change its name, description or location.
 You can also add the topic `cmux-extension` (or `cmux-setup`) to your repo: cmux.com lists such repos
 as candidates and links them to a prefilled pull request here.
 
+## Link your repo without a pull request
+
+You can put a public GitHub repo on cmux.com yourself, with no entry here. It shows as a community
+listing (not reviewed) and keeps its page in step with the repo: README, version and install. The
+manifest or marker file (`cmux-app.json`, `cmux-theme.json`, `cmux-snippet.json` or `cmux-setup.json`)
+goes at the repo root, and its `id` starts with your GitHub user or org. Link it in one of two ways:
+
+- **On cmux.com**: sign in at [cmux.com/extensions/link](https://cmux.com/extensions/link), connect
+  GitHub (the cmux GitHub App, on the account that owns the repo), and pick the repo.
+- **From the repo itself**: add a workflow that sends a GitHub Actions OIDC token, with audience
+  `https://cmux.com`, to the registry's link route. Every push and every release then updates the
+  page at once:
+
+  ```yaml
+  name: Link to cmux.com
+  on:
+    push:
+      branches: [main]
+    release:
+      types: [published]
+  permissions:
+    contents: read
+    id-token: write
+  jobs:
+    link:
+      runs-on: ubuntu-latest
+      steps:
+        - run: |
+            token=$(curl -sS --fail -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://cmux.com" | jq -r .value)
+            curl -sS --fail-with-body -X POST https://cmux-platform-production.debussy.workers.dev/v1/extensions/link \
+              -H "Authorization: Bearer $token" -H "content-type: application/json" \
+              -d "{\"repo\":\"$GITHUB_REPOSITORY\"}"
+  ```
+
+Either way, only the repo's owner can link it. To get a reviewed listing in the cmux App Store,
+add an entry here as described above. When a repo is both linked and listed here, the listing here wins.
+
 ## What the automated review checks
 
 [`review/review.py`](review/review.py) runs on every pull request ([`Review`](.github/workflows/review.yml)),
