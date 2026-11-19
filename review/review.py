@@ -12,12 +12,16 @@ a pull request adds or changes, fetches what the entry points at:
 - snippets: `cmux-snippet.json` (`"cmuxSnippet": 1`, a profile of settings and stylesheets), no
   actions, views or theme file; its stylesheets import nothing and load nothing remote.
 - setups: `cmux-setup.json` (`"cmuxSetup": 1`, id); the reviewer sees its actions and extensions.
+  Its settings are checked against the newest cmux nightly's settings schema, as `check_profile`
+  checks them at install (a key the nightly has, one an agent may set, a value its row accepts),
+  and its `agent-pane/theme.css` against the nightly's `cmux.agentPane.style/1` tokens.
 
 Writes a Markdown summary (the PR comment) and exits 1 when any check fails.
 
-    python3 review/review.py --root . --base-dir BASE [--all] [--out comment.md]
+    python3 review/review.py --root . --base-dir BASE [--all] [--cmux-ref SHA] [--out comment.md]
 
-BASE holds the base branch's copies of the entry files (a missing file is empty).
+BASE holds the base branch's copies of the entry files (a missing file is empty). `--cmux-ref`
+checks setups against that cmux commit instead of the newest nightly.
 """
 
 from __future__ import annotations
@@ -87,6 +91,24 @@ README_LIMIT = 512 * 1024
 RELEASES_LOOKED_AT = 30
 SCOPE_REASON_MIN = 10
 
+# The cmux a setup must install on: the newest nightly. Its appcasts name the commit it was built
+# from (`cmux:sourceCommit`); the schemas are read at that commit.
+CMUX_REPO = "manaflow-ai/cmux"
+NIGHTLY_APPCASTS = (
+    "https://github.com/manaflow-ai/cmux/releases/download/nightly-next/appcast-arm64.xml",
+    "https://github.com/manaflow-ai/cmux/releases/download/nightly-next/appcast.xml",
+)
+CMUX_RAW = "https://raw.githubusercontent.com/" + CMUX_REPO + "/{ref}/{path}"
+SETTINGS_SCHEMA = "schemas/settings/settings-schema.json"
+RETIRED_KEYS = "schemas/settings/retired-keys.json"
+STYLE_TOKENS = "schemas/agent-pane/style-tokens.json"
+# Lands with the per-key skip (cmux#46232): from then on an install leaves out a key the cmux
+# lacks and lists it, so an unknown key is a warning; before it, the whole setup is refused.
+PUBLISHED_KEYS = "schemas/settings/published-keys.txt"
+APPCAST_LIMIT = 4 * 1024 * 1024
+CMUX_SCHEMA_LIMIT = 32 * 1024 * 1024
+STYLESHEET_WITH_TOKENS = "agent-pane/theme.css"
+
 # Characters that hide what code does (cmux-app-manifest hidden.rs): direction
 # controls and marks, zero-width and invisible characters, tag and variation blocks.
 HIDDEN = re.compile(
@@ -106,9 +128,12 @@ class FetchError(Exception):
 class GitHub:
     """Reads public repositories through the GitHub REST API."""
 
-    def __init__(self, token: str | None = None, api: str = "https://api.github.com"):
+    def __init__(self, token: str | None = None, api: str = "https://api.github.com", cmux_ref: str | None = None):
         self.token = token
         self.api = api
+        # The cmux commit setups are checked against; None is the newest nightly.
+        self.cmux_ref = cmux_ref
+        self.cmux_target: CmuxTarget | FetchError | None = None
 
     def _open(self, url: str, accept: str, limit: int) -> bytes:
         headers = {"Accept": accept, "User-Agent": "cmux-extensions-review"}
@@ -798,7 +823,307 @@ def check_setup(gh: GitHub, entry: dict, result: Result) -> None:
         result.glance.append(f"installs extension `{ref}`")
     if setup.get("settings"):
         result.glance.append(f"settings: {', '.join(sorted(setup['settings'])[:20])}")
+    check_setup_on_cmux(gh, marked, result)
     check_readme(gh, marked.owner, marked.repo, marked.ref, result)
+
+
+# ---------------------------------------------------------------- against the cmux nightly
+
+
+@dataclass
+class CmuxTarget:
+    """What the newest nightly (or `--cmux-ref`) installs: its settings rows by key, its retired
+    keys, its agent-pane style tokens (None while it publishes none), and whether its install
+    leaves out a key it lacks (cmux#46232) or refuses the whole setup."""
+
+    ref: str
+    label: str
+    rows: dict[str, dict]
+    retired: dict[str, dict]
+    tokens: dict[str, dict] | None
+    skips_unknown: bool
+
+
+def nightly_commit(gh: GitHub) -> tuple[str, str]:
+    """The newest nightly's source commit and version, from the appcasts."""
+    best: tuple[int, str, str] | None = None
+    problems = []
+    for url in NIGHTLY_APPCASTS:
+        try:
+            text = gh.download(url, APPCAST_LIMIT).decode("utf-8", "replace")
+        except (NotFound, FetchError) as error:
+            problems.append(str(error))
+            continue
+        for item in re.findall(r"<item>(.*?)</item>", text, re.S):
+            build = re.search(r"<sparkle:version>\s*(\d+)\s*<", item)
+            commit = re.search(r"<cmux:sourceCommit[^>]*>\s*([0-9a-f]{40})\s*<", item)
+            if not build or not commit:
+                continue
+            short = re.search(r"<sparkle:shortVersionString>\s*([^<\s]+)\s*<", item)
+            candidate = (int(build.group(1)), commit.group(1), short.group(1) if short else build.group(1))
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    if best is None:
+        raise FetchError("no nightly appcast names its source commit" + (f" ({'; '.join(problems)})" if problems else ""))
+    return best[1], best[2]
+
+
+def cmux_file(gh: GitHub, ref: str, path: str) -> bytes:
+    return gh.download(CMUX_RAW.format(ref=ref, path=path), CMUX_SCHEMA_LIMIT)
+
+
+def load_cmux_target(gh: GitHub) -> CmuxTarget:
+    """Reads the target once per run (the schema is a few MB); a failure is kept and re-raised."""
+    if isinstance(gh.cmux_target, CmuxTarget):
+        return gh.cmux_target
+    if isinstance(gh.cmux_target, FetchError):
+        raise gh.cmux_target
+    try:
+        if gh.cmux_ref:
+            ref, label = gh.cmux_ref, f"cmux at {gh.cmux_ref}"
+        else:
+            ref, version = nightly_commit(gh)
+            label = f"the cmux nightly {version} ({ref[:12]})"
+        try:
+            schema = json.loads(cmux_file(gh, ref, SETTINGS_SCHEMA))
+        except NotFound:
+            raise FetchError(f"{CMUX_REPO} has no {SETTINGS_SCHEMA} at {ref}") from None
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise FetchError(f"{SETTINGS_SCHEMA} at {ref} does not parse: {error}") from None
+        rows = {row["key"]: row for row in schema.get("rows") or [] if isinstance(row, dict) and "key" in row}
+        if not rows:
+            raise FetchError(f"{SETTINGS_SCHEMA} at {ref} has no rows")
+        retired = {}
+        try:
+            retired_file = json.loads(cmux_file(gh, ref, RETIRED_KEYS))
+            retired = {e["key"]: e for e in retired_file.get("retired") or [] if isinstance(e, dict) and "key" in e}
+        except (NotFound, json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        tokens = None
+        try:
+            tokens_file = json.loads(cmux_file(gh, ref, STYLE_TOKENS))
+            tokens = {t["name"]: t for t in tokens_file.get("tokens") or [] if isinstance(t, dict) and "name" in t}
+        except NotFound:
+            pass
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise FetchError(f"{STYLE_TOKENS} at {ref} does not parse: {error}") from None
+        try:
+            cmux_file(gh, ref, PUBLISHED_KEYS)
+            skips_unknown = True
+        except NotFound:
+            skips_unknown = False
+        gh.cmux_target = CmuxTarget(ref, label, rows, retired, tokens, skips_unknown)
+        return gh.cmux_target
+    except FetchError as error:
+        gh.cmux_target = error
+        raise
+
+
+HEX_COLOR = re.compile(r"#?(?:[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})")
+HTTP_ORIGIN = re.compile(r"https?://[^/?#\s@]+/?")
+CLOCK = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d")
+APP_ID = re.compile(r"[a-z0-9-]+/[a-z0-9-]+")
+SOUND_RULE_EVENTS = ("finished", "needsInput", "error", "bell", "message")
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def _in_range(row: dict, value) -> bool:
+    bounds = row.get("range") or {}
+    low, high = bounds.get("min"), bounds.get("max")
+    return _number(value) and (low is None or value >= low) and (high is None or value <= high)
+
+
+def _choices(row: dict) -> list[str]:
+    return [c["value"] if isinstance(c, dict) else c for c in row.get("choices") or []]
+
+
+def _sound_rule(value) -> bool:
+    if isinstance(value, str):
+        return True
+    if not isinstance(value, dict):
+        return False
+    for key, member in value.items():
+        if key == "sound" and isinstance(member, str):
+            continue
+        if key == "volume" and _number(member) and 0 <= member <= 1:
+            continue
+        if key == "events" and isinstance(member, dict) and all(
+            name in SOUND_RULE_EVENTS and isinstance(sound, str) for name, sound in member.items()
+        ):
+            continue
+        return False
+    return True
+
+
+# Per kind, as cmux-config `schema/accepts.rs` `is_accepted`. A value domain the app publishes at
+# run time (themes, fonts, sounds) is checked only for its type here.
+KIND_ACCEPTS = {
+    "choice": lambda row, v: isinstance(v, str) and v in _choices(row),
+    "choice_or_number": lambda row, v: (isinstance(v, str) and v in _choices(row)) or _in_range(row, v),
+    "choice_or_url": lambda row, v: (isinstance(v, str) and v in _choices(row))
+    or (isinstance(v, dict) and len(v) == 1 and isinstance(v.get(row.get("url_key")), str)
+        and HTTP_ORIGIN.fullmatch(v[row.get("url_key")]) is not None),
+    "toggle": lambda row, v: isinstance(v, bool),
+    "number": _in_range,
+    "color": lambda row, v: isinstance(v, str) and HEX_COLOR.fullmatch(v) is not None,
+    "url": lambda row, v: isinstance(v, str),
+    "host_list": lambda row, v: isinstance(v, list) and all(isinstance(i, str) for i in v),
+    "time_range": lambda row, v: isinstance(v, dict)
+    and all(isinstance(v.get(k), str) and CLOCK.fullmatch(v[k]) for k in ("start", "end")),
+    "theme": lambda row, v: isinstance(v, str),
+    "font_family": lambda row, v: isinstance(v, str),
+    "sound": lambda row, v: isinstance(v, str),
+    "text": lambda row, v: isinstance(v, str),
+    "folder_list": lambda row, v: isinstance(v, list)
+    and all(isinstance(i, str) and (i.startswith("/") or i.startswith("~/")) for i in v),
+    "string_list": lambda row, v: isinstance(v, list) and all(
+        isinstance(i, str) and i and (not row.get("choices") or i in _choices(row)) for i in v
+    ),
+    "number_list": lambda row, v: isinstance(v, list) and all(_in_range(row, i) for i in v),
+    "string_map": lambda row, v: isinstance(v, dict) and all(isinstance(i, str) for i in v.values()),
+    "sound_rules": lambda row, v: isinstance(v, dict) and all(_sound_rule(i) for i in v.values()),
+}
+
+# Rows whose `validation` is a domain with a shape of its own: the type is checked here, the rest
+# by cmux at install.
+DOMAIN_TYPES = {
+    "domain:app_id": lambda v: isinstance(v, str) and APP_ID.fullmatch(v) is not None,
+    "domain:chat_roots": lambda v: isinstance(v, list) and all(isinstance(i, str) for i in v),
+    "domain:custom_densities": lambda v: isinstance(v, list) and all(isinstance(i, dict) for i in v),
+    "domain:command_labels": lambda v: isinstance(v, list) and all(isinstance(i, (str, dict)) for i in v),
+    "domain:backdrop_schedule": lambda v: isinstance(v, dict),
+    "domain:backdrop_location": lambda v: isinstance(v, str),
+    "domain:backdrop_picture": lambda v: isinstance(v, str),
+    "domain:search_template": lambda v: isinstance(v, str),
+}
+
+
+def value_accepted(row: dict, value) -> bool | None:
+    """True or False as the row takes `value`; None for a kind this checker does not know."""
+    validation = row.get("validation")
+    if validation in DOMAIN_TYPES:
+        return DOMAIN_TYPES[validation](value)
+    if validation == "domain:backdrop_selection" and isinstance(value, str):
+        for prefix in ("system:", "file:"):
+            if value.startswith(prefix) and value[len(prefix):].startswith("/"):
+                return True
+        if value.startswith("folder:/") and len(value) > len("folder:/"):
+            return True
+    check = KIND_ACCEPTS.get(row.get("kind"))
+    return None if check is None else bool(check(row, value))
+
+
+def row_drift(row: dict) -> str | None:
+    """Why this review cannot judge the row's values, or None: a kind it does not know, or one of
+    the row's own `accepts` or `refuses` samples it reads differently from cmux. The detector for a
+    kind or rule cmux added after this file was written; such a value is a warning, not a FAIL."""
+    if row.get("kind") not in KIND_ACCEPTS:
+        return f"its kind `{row.get('kind')}` is new to this review"
+    if str(row.get("validation", "portable")).startswith("domain:"):
+        return None
+    for sample in row.get("accepts") or []:
+        if value_accepted(row, sample) is False:
+            return f"this review refuses {json.dumps(sample)}, which the schema accepts"
+    for sample in row.get("refuses") or []:
+        if value_accepted(row, sample) is True and row.get("kind") not in ("url", "theme", "font_family", "sound"):
+            return f"this review accepts {json.dumps(sample)}, which the schema refuses"
+    return None
+
+
+def check_setup_settings(target: CmuxTarget, settings: dict, result: Result) -> None:
+    on = target.label
+    for key, value in settings.items():
+        row = target.rows.get(key)
+        if row is None:
+            old = target.retired.get(key)
+            new = old.get("replaced_by") if old else None
+            why = f" ({old['reason']})" if old and old.get("reason") else ""
+            if old and new and new in target.rows:
+                mapped = value
+                for pair in old.get("values") or []:
+                    if isinstance(pair, dict) and pair.get("from") == value:
+                        mapped = pair.get("to")
+                if target.skips_unknown:
+                    result.warnings.append(f"setting `{key}` was renamed to `{new}`{why}; {on} installs it under the new name: set `{new}`")
+                    row, key, value = target.rows[new], new, mapped
+                else:
+                    result.errors.append(f"setting `{key}` was renamed to `{new}`{why}: {on} refuses the whole setup until it sets `{new}`")
+                    continue
+            elif target.skips_unknown:
+                result.warnings.append(f"setting `{key}` is not one {on} has{why}: its install leaves it out and lists it")
+                continue
+            else:
+                result.errors.append(f"setting `{key}` is not one {on} has{why}: its install refuses the whole setup")
+                continue
+        if not row.get("agent_settable", False):
+            result.errors.append(f"setting `{key}` is one only the person can change: {on} refuses a setup that sets it")
+            continue
+        drift = row_drift(row)
+        if drift:
+            result.warnings.append(f"setting `{key}`: its value is not checked here, because {drift} (update `KIND_ACCEPTS` in review/review.py)")
+            continue
+        if value_accepted(row, value) is False:
+            shown = json.dumps(value)
+            shown = shown if len(shown) <= 60 else shown[:57] + "..."
+            hint = f"; one of {', '.join(_choices(row)[:12])}" if row.get("kind") == "choice" else ""
+            bounds = row.get("range") or {}
+            if row.get("kind") in ("number", "choice_or_number", "number_list") and bounds:
+                hint = f"; {bounds.get('min')} to {bounds.get('max')}"
+            result.errors.append(f"setting `{key}`: {shown} is not a value it takes in {on} (a {row.get('kind')}{hint})")
+
+
+CSS_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+CSS_DECLARED = re.compile(r"(?<![\w-])(--[A-Za-z0-9_-]+)\s*:")
+
+
+def check_setup_tokens(target: CmuxTarget, css: str, result: Result) -> None:
+    declared = sorted(set(CSS_DECLARED.findall(CSS_COMMENT.sub("", css))))
+    if not declared:
+        return
+    if target.tokens is None:
+        result.warnings.append(
+            f"`{STYLESHEET_WITH_TOKENS}` sets {len(declared)} custom properties, and {target.label} publishes no "
+            f"`{STYLE_TOKENS}` yet, so none is checked"
+        )
+        return
+    for name in declared:
+        token = target.tokens.get(name)
+        if token is None:
+            result.warnings.append(f"`{STYLESHEET_WITH_TOKENS}` sets `{name}`, which is not a cmux.agentPane.style/1 token in {target.label}: it paints nothing")
+        elif token.get("replacedBy"):
+            result.warnings.append(f"`{STYLESHEET_WITH_TOKENS}` sets `{name}`, which {target.label} renamed to `{token['replacedBy']}`")
+
+
+def check_setup_on_cmux(gh: GitHub, marked: Marked, result: Result) -> None:
+    try:
+        target = load_cmux_target(gh)
+    except (NotFound, FetchError) as error:
+        result.warnings.append(f"could not read the cmux nightly's settings schema, so the settings and stylesheet are not checked against it: {error}")
+        return
+    settings = marked.data.get("settings") or {}
+    if not isinstance(settings, dict):
+        result.errors.append(f"`{SETUP_FILE}`: `settings` must be an object of dotted keys")
+        settings = {}
+    check_setup_settings(target, settings, result)
+    inline = marked.data.get("files") if isinstance(marked.data.get("files"), dict) else {}
+    css = inline.get(STYLESHEET_WITH_TOKENS)
+    if not isinstance(css, str):
+        try:
+            css = marked.read(gh, STYLESHEET_WITH_TOKENS, SNIPPET_LIMIT).decode("utf-8-sig")
+        except NotFound:
+            css = None
+        except FetchError as error:
+            result.errors.append(str(error))
+            css = None
+        except UnicodeDecodeError:
+            result.errors.append(f"`{STYLESHEET_WITH_TOKENS}` is not UTF-8")
+            css = None
+    if css:
+        check_setup_tokens(target, css, result)
+    result.checked.append(f"settings and stylesheet tokens against {target.label}")
 
 
 
@@ -868,9 +1193,12 @@ def main(argv: list[str] | None = None, gh: GitHub | None = None) -> int:
     parser.add_argument("--all", action="store_true", help="fetch and check every entry, not only added or changed ones")
     parser.add_argument("--out", type=Path, help="write the Markdown summary here")
     parser.add_argument("--quiet", action="store_true", help="do not print the summary")
+    parser.add_argument("--cmux-ref", help="check setups against this cmux commit, not the newest nightly")
     args = parser.parse_args(argv)
 
     gh = gh or GitHub(os.environ.get("GITHUB_TOKEN"))
+    if args.cmux_ref:
+        gh.cmux_ref = args.cmux_ref
     entries, file_errors = load_entries(args.root)
     file_errors += file_checks(entries)
     changes, removed = diff(entries, load_base(args.base_dir))
