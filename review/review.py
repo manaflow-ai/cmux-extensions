@@ -811,7 +811,7 @@ def check_snippet(gh: GitHub, entry: dict, result: Result) -> None:
     check_readme(gh, marked.owner, marked.repo, marked.ref, result)
 
 
-def check_setup(gh: GitHub, entry: dict, result: Result, readme: bool = True) -> None:
+def check_setup(gh: GitHub, entry: dict, result: Result) -> None:
     marked = read_marker(gh, entry, SETUP_FILE, "cmuxSetup", SETUP_LIMIT, result)
     if marked is None:
         return
@@ -824,8 +824,7 @@ def check_setup(gh: GitHub, entry: dict, result: Result, readme: bool = True) ->
     if setup.get("settings"):
         result.glance.append(f"settings: {', '.join(sorted(setup['settings'])[:20])}")
     check_setup_on_cmux(gh, marked, result)
-    if readme:
-        check_readme(gh, marked.owner, marked.repo, marked.ref, result)
+    check_readme(gh, marked.owner, marked.repo, marked.ref, result)
 
 
 # ---------------------------------------------------------------- against the cmux nightly
