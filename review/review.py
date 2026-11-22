@@ -6,7 +6,8 @@ a pull request adds or changes, fetches what the entry points at:
 
 - extensions: the newest release with `cmux-app.json` or `cmux-app.v2.json` and `cmux-extension.tar.gz`;
   the manifest against the vendored v2 schema, id, tag, scope reasons; the package's
-  manifest equals the asset, the files it names are there, its script parses.
+  manifest equals the asset, the files it names are there, its script parses, and
+  `cmux ext design --listing` finds no design warning in its recorded scenes (`CMUX_BIN`).
 - themes: `cmux-theme.json` (`"cmuxTheme": 1`, id, version tag) and each theme file it names
   (default every `themes/*.json`): JSONC object, `colors`, size, at most 16, `use` names one.
 - snippets: `cmux-snippet.json` (`"cmuxSnippet": 1`, a profile of settings and stylesheets), no
@@ -475,6 +476,66 @@ def script_parses(source: bytes) -> str | None:
     return "; ".join(lines[:4]) or "node --check failed"
 
 
+def cmux_binary() -> str | None:
+    """The cmux CLI the design check runs: `CMUX_BIN`, else `cmux` on PATH."""
+    return os.environ.get("CMUX_BIN") or shutil.which("cmux")
+
+
+def check_design(tar: tarfile.TarFile, members: dict[str, tarfile.TarInfo], root: str, result: Result) -> None:
+    """`cmux ext design --listing DIR --json` on the unpacked package: any design warning in its
+    recorded scenes (`preview/scenes.json`, written by `cmux ext shot --record`) refuses the
+    listing, each with its fix. Without a cmux CLI a reviewer runs it by hand."""
+    cmux = cmux_binary()
+    if not cmux:
+        result.warnings.append(
+            "design check not run (no cmux CLI here; set CMUX_BIN): a reviewer runs "
+            "`cmux ext design --listing <unpacked package>` by hand"
+        )
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        for name, member in members.items():
+            if not name.startswith(root) or not member.isfile():
+                continue
+            target = base / name[len(root):]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            handle = tar.extractfile(member)
+            target.write_bytes(handle.read() if handle else b"")
+        try:
+            run = subprocess.run(
+                [cmux, "ext", "design", "--listing", str(base), "--json"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            result.errors.append(f"design check did not run: {error}")
+            return
+    try:
+        report = json.loads(run.stdout)
+    except json.JSONDecodeError:
+        lines = [line for line in (run.stderr or run.stdout).splitlines() if line.strip()]
+        result.errors.append(f"design check failed (exit {run.returncode}): {'; '.join(lines[:4]) or 'no output'}")
+        return
+    if not isinstance(report, dict):
+        result.errors.append(f"design check printed no report (exit {run.returncode})")
+        return
+    if report.get("missing"):
+        result.errors.append(f"design: {report['missing']}")
+    for scene in report.get("scenes") or []:
+        for finding in scene.get("design") or []:
+            where = f" at {finding['node']}" if finding.get("node") else ""
+            count = finding.get("count") or 1
+            times = f" (x{count})" if count > 1 else ""
+            result.errors.append(
+                f"design: `{scene.get('scene')}`: {finding.get('check')}{where}: "
+                f"{finding.get('message')}{times}; fix: {finding.get('fix')}"
+            )
+    if report.get("ok") and run.returncode == 0:
+        count = len(report.get("scenes") or [])
+        result.checked.append(f"design ({count} recorded scene{'' if count == 1 else 's'}, no warning)")
+    elif not any(e.startswith("design") for e in result.errors):
+        result.errors.append(f"design check refused the listing (exit {run.returncode}) without a finding")
+
+
 def check_scopes(manifest: dict, result: Result) -> None:
     for key in ("scopes", "optionalScopes"):
         for scope, reason in (manifest.get(key) or {}).items():
@@ -589,6 +650,8 @@ def check_package(gh: GitHub, release: dict, manifest_asset: str, manifest: dict
     for path in files:
         if root + path not in members and not any(n.startswith(root + path + "/") for n in members):
             result.errors.append(f"`files` lists `{path}`, which is not in `{PACKAGE_ASSET}`")
+
+    check_design(tar, members, root, result)
 
     main = (manifest.get("runtime") or {}).get("main")
     if isinstance(main, str) and root + main in members:

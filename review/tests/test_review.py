@@ -8,11 +8,24 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import review  # noqa: E402
+
+# A cmux on this machine's PATH would design-check every package here; DesignTests gives its own.
+NO_CMUX = mock.patch.object(review, "cmux_binary", return_value=None)
+
+
+def setUpModule():
+    NO_CMUX.start()
+
+
+def tearDownModule():
+    NO_CMUX.stop()
+
 
 API = "https://api.github.com"
 DL = "https://github.com/dl"
@@ -188,6 +201,87 @@ class ExtensionTests(unittest.TestCase):
         result = run({**ENTRY, "repo": "https://codeberg.org/alice/cmux-focus"}, {})
         self.assertEqual(result.errors, [])
         self.assertIn("by hand", result.warnings[0])
+
+
+WIDGET = {**MANIFEST, "files": ["dist/", "preview/"]}
+SCENES = b'{"cmux.widget/1 small": {"ops": []}}'
+
+
+def fake_cmux(folder: Path, report: dict | None, code: int = 0, stderr: str = "") -> str:
+    """A `cmux` in `folder` that records its arguments and the unpacked folder's files, then prints `report`."""
+    log = folder / "log.json"
+    script = folder / "cmux"
+    out = json.dumps(report) if report is not None else ""
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "d = sys.argv[4]\n"
+        "files = sorted(os.path.relpath(os.path.join(r, f), d) for r, _, fs in os.walk(d) for f in fs)\n"
+        f"open({str(log)!r}, 'w').write(json.dumps({{'argv': sys.argv[1:], 'files': files}}))\n"
+        f"sys.stdout.write({out!r})\n"
+        f"sys.stderr.write({stderr!r})\n"
+        f"sys.exit({code})\n"
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+def widget_package(prefix: str = "") -> bytes:
+    return tarball({"cmux-app.v2.json": j(WIDGET), "dist/main.js": b"1;\n", "preview/scenes.json": SCENES}, prefix=prefix)
+
+
+class DesignTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def review_with(self, cmux: str | None, package: bytes | None = None):
+        with mock.patch.object(review, "cmux_binary", return_value=cmux):
+            return run(ENTRY, extension_repo(manifest=WIDGET, package=package or widget_package()))
+
+    def calls(self, cmux: str) -> dict:
+        return json.loads((Path(cmux).parent / "log.json").read_text())
+
+    def test_clean_scenes_pass(self):
+        cmux = fake_cmux(self.tmp, {"ok": True, "missing": None, "warnings": 0,
+                          "scenes": [{"scene": "preview/scenes.json:cmux.widget/1 small", "design": []}]})
+        result = self.review_with(cmux, widget_package(prefix="focus/"))
+        self.assertEqual(result.errors, [])
+        self.assertIn("design (1 recorded scene, no warning)", result.checked)
+        call = self.calls(cmux)
+        self.assertEqual(call["argv"][:3], ["ext", "design", "--listing"])
+        self.assertEqual(call["argv"][4:], ["--json"])
+        # The package's top folder is stripped: the CLI sees the manifest at the folder's top.
+        self.assertEqual(call["files"], ["cmux-app.v2.json", "dist/main.js", "preview/scenes.json"])
+
+    def test_any_warning_refuses_with_its_fix(self):
+        cmux = fake_cmux(self.tmp, {"ok": False, "missing": None, "warnings": 1, "scenes": [
+            {"scene": "preview/scenes.json:cmux.widget/1 small", "design": [
+                {"check": "space", "node": "Stack#root", "message": "gap 5 is not on the space scale",
+                 "fix": "use 6", "count": 2}]}]}, code=1)
+        result = self.review_with(cmux)
+        self.assertEqual(len(result.errors), 1)
+        error = result.errors[0]
+        self.assertIn("design: `preview/scenes.json:cmux.widget/1 small`: space at Stack#root", error)
+        self.assertIn("gap 5 is not on the space scale (x2); fix: use 6", error)
+
+    def test_no_recorded_scenes_refuses(self):
+        cmux = fake_cmux(self.tmp, {"ok": False, "missing": "no recorded scenes: run cmux ext shot --record",
+                          "warnings": 0, "scenes": []}, code=1)
+        result = self.review_with(cmux)
+        self.assertEqual(result.errors, ["design: no recorded scenes: run cmux ext shot --record"])
+
+    def test_cli_failure_refuses(self):
+        cmux = fake_cmux(self.tmp, None, code=4, stderr="cmux: x: no cmux-app.json that reads\n")
+        result = self.review_with(cmux)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("design check failed (exit 4): cmux: x: no cmux-app.json that reads", result.errors[0])
+
+    def test_no_cmux_leaves_it_to_a_reviewer(self):
+        result = self.review_with(None)
+        self.assertEqual(result.errors, [])
+        self.assertTrue(any("cmux ext design --listing" in w and "by hand" in w for w in result.warnings))
 
 
 def raw(owner, repo, path, ref):
